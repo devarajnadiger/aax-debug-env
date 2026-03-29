@@ -6,6 +6,7 @@ colorTo: green
 sdk: docker
 app_port: 7860
 pinned: false
+license: mit
 ---
 
 # Ask–Act–Explore: A Cost-Aware Mobile Debugging Environment for AI Agents
