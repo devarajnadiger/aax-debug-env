@@ -1,15 +1,3 @@
----
-title: Ask Act Explore Debug Env
-emoji: 🐛
-colorFrom: blue
-colorTo: green
-sdk: docker
-app_port: 7860
-pinned: false
-license: mit
-short_description: Cost-aware OpenEnv for mobile debugging agents
----
-
 <div align="center">
 
 # 🐛 Ask–Act–Explore
