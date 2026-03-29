@@ -1,0 +1,83 @@
+name: aax-debug-env
+version: "1.0.0"
+description: >
+  Ask–Act–Explore: A cost-aware mobile debugging environment for AI agents.
+  The agent debugs mobile app issues by deciding when to act, explore, or ask
+  under a dense reward system that penalises inefficiency.
+
+type: http
+
+api:
+  base_url: http://localhost:7860
+  endpoints:
+    reset:
+      method: POST
+      path: /reset
+    step:
+      method: POST
+      path: /step
+    state:
+      method: GET
+      path: /state
+    grade:
+      method: GET
+      path: /grade
+
+observation_space:
+  type: object
+  properties:
+    task_id:
+      type: string
+    task:
+      type: string
+    difficulty:
+      type: string
+      enum: [easy, medium, hard]
+    scenario:
+      type: string
+    screen:
+      type: string
+    logs:
+      type: string
+    revealed_info:
+      type: array
+      items:
+        type: string
+    history:
+      type: array
+      items:
+        type: string
+    steps_taken:
+      type: integer
+    steps_left:
+      type: integer
+    ask_count:
+      type: integer
+
+action_space:
+  type: object
+  properties:
+    type:
+      type: string
+      enum: [act, explore, ask]
+    target:
+      type: string
+      nullable: true
+    content:
+      type: string
+      nullable: true
+  required:
+    - type
+
+reward_range: [-1.0, 1.0]
+
+tasks:
+  - id: task_easy
+    difficulty: easy
+    max_steps: 6
+  - id: task_medium
+    difficulty: medium
+    max_steps: 8
+  - id: task_hard
+    difficulty: hard
+    max_steps: 8
