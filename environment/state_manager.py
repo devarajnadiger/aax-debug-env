@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from .models import Observation
 from .oracle import HumanOracle
 
 
@@ -68,7 +67,7 @@ class StateManager:
     def explore_already_seen(self, target: str) -> bool:
         return target in self._revealed
 
-    def observation(self) -> Observation:
+    def observation(self):
         return Observation(
             task_id=self._task["id"],
             task=self._task["scenario"],

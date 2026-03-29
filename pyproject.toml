@@ -12,7 +12,8 @@ requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0,<3.0",
     "fastapi>=0.110.0",
-    "uvicorn[standard]>=0.29.0",
+    "uvicorn>=0.29.0",
+    "openenv-core>=0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -25,11 +26,11 @@ dev = [
 ]
 
 [project.scripts]
-aax-serve = "api:main"
+serve = "server.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["environment*"]
+include = ["environment*", "server*"]
 
 [tool.setuptools.package-data]
 "*" = ["data/*.json", "openenv.yaml"]

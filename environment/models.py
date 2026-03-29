@@ -1,58 +1,48 @@
-"""Typed models for the Ask-Act-Explore environment (OpenEnv compliant)."""
+"""Typed models for the Ask-Act-Explore environment (OpenEnv compliant).
+
+Inherits from openenv_core base classes so the framework can auto-generate
+/schema, /reset, and /step endpoints with correct validation.
+"""
 
 from __future__ import annotations
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from openenv_core import Action as BaseAction
+from openenv_core import Observation as BaseObservation
 
 
-class Observation(BaseModel):
-    """What the agent sees at each step."""
+class AaxObservation(BaseObservation):
+    """Full observation returned by reset() and step()."""
 
-    task_id: str
-    task: str = ""           # human-readable task description (alias for scenario)
-    difficulty: Literal["easy", "medium", "hard"]
-    scenario: str
-    screen: str
-    logs: str
-    revealed_info: List[str] = Field(default_factory=list)
-    history: List[str] = Field(default_factory=list)
+    task_id: str = ""
+    task: str = ""                          # human-readable scenario (required by OpenEnv spec)
+    difficulty: str = ""
+    scenario: str = ""
+    screen: str = ""
+    logs: str = ""
+    revealed_info: List[str] = []
+    history: List[str] = []
     steps_taken: int = 0
     steps_left: int = 8
     ask_count: int = 0
+    # done + reward + metadata inherited from BaseObservation
 
 
-class Action(BaseModel):
-    """An action the agent can take."""
+class AaxAction(BaseAction):
+    """Action the agent takes at each step."""
 
     type: Literal["act", "explore", "ask"]
-    # For explore: name of what to examine (e.g. "stack_trace", "source_code")
-    # For act:     short description of the fix attempt
-    # For ask:     optional question to the oracle (free text)
-    target: Optional[str] = None
-    content: Optional[str] = None
+    target: Optional[str] = None    # explore: which source; act: unused
+    content: Optional[str] = None   # ask: question text; act: fix description
+    # metadata inherited from BaseAction
 
 
-class Reward(BaseModel):
-    """Reward signal returned by step()."""
-
-    value: float
-    reason: str
-
-
-class StepResult(BaseModel):
-    """Full result of a step() call."""
-
-    observation: Observation
-    reward: Reward
-    done: bool
-    info: dict = Field(default_factory=dict)
+# Keep GradeResult as a plain Pydantic model (not an OpenEnv type)
+from pydantic import BaseModel, Field
 
 
 class GradeResult(BaseModel):
-    """Final evaluation score from the grader."""
-
     score: float = Field(ge=0.0, le=1.0)
     solved: bool
     efficient: bool

@@ -1,188 +1,183 @@
 """AaxDebugEnv — OpenEnv-compliant main environment.
 
-Public API:
-    env.reset(task_id)                → Observation
-    env.step(action)                  → (Observation, Reward, done, info)
-    env.state()                       → Observation
-    env.grade()                       → GradeResult
-    env.available_tasks()             → List[str]
+The framework creates a fresh env instance per HTTP request, so all
+mutable episode state lives in a module-level session store keyed by
+task_id. This works correctly for single-session use (the validator)
+and for sequential multi-user use.
+
+Public API (OpenEnv):
+    env.reset(task_id="task_easy", seed=None, episode_id=None)  → AaxObservation
+    env.step(action)                                             → AaxObservation
+    env.state                                                    → AaxObservation
+    env.grade()                                                  → GradeResult
 """
 
 from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import uuid
+from typing import Any, Dict, List, Optional
+
+from openenv_core import Environment
 
 from .grader import Grader
-from .models import Action, GradeResult, Observation, Reward, StepResult
+from .models import AaxAction, AaxObservation, GradeResult
+from .oracle import HumanOracle
 from .reward_engine import RewardEngine
 from .state_manager import StateManager
 
-# Path to bundled task data
 _DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "tasks.json")
 
 
 def _load_tasks() -> Dict[str, Dict[str, Any]]:
     with open(_DATA_PATH, "r", encoding="utf-8") as fh:
         raw: List[Dict[str, Any]] = json.load(fh)
-    return {task["id"]: task for task in raw}
+    return {t["id"]: t for t in raw}
 
 
-class AaxDebugEnv:
-    """Ask–Act–Explore mobile debugging environment.
+_TASKS: Dict[str, Dict[str, Any]] = _load_tasks()
 
-    Usage
-    -----
-    >>> env = AaxDebugEnv()
-    >>> obs = env.reset("task_easy")
-    >>> action = Action(type="explore", target="stack_trace")
-    >>> obs, reward, done, info = env.step(action)
-    >>> result = env.grade()
-    """
+# Module-level session store — persists across the per-request env instances
+# that the OpenEnv HTTP framework creates.
+_SESSIONS: Dict[str, StateManager] = {}
+_SESSION_TASKS: Dict[str, Dict[str, Any]] = {}
+_CURRENT_SESSION_ID: Optional[str] = None   # points to the most recently reset session
+
+_reward_engine = RewardEngine()
+_grader = Grader()
+
+
+class AaxDebugEnv(Environment[AaxAction, AaxObservation, AaxObservation]):
+    """Ask–Act–Explore mobile debugging environment."""
+
+    SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
     def __init__(self) -> None:
-        self._tasks: Dict[str, Dict[str, Any]] = _load_tasks()
-        self._reward_engine = RewardEngine()
-        self._grader = Grader()
-        self._state_mgr: Optional[StateManager] = None
-        self._current_task: Optional[Dict[str, Any]] = None
+        super().__init__()
+        self._session_id: Optional[str] = None
 
     # ------------------------------------------------------------------ #
-    # Core API                                                             #
+    # OpenEnv API                                                          #
     # ------------------------------------------------------------------ #
 
-    def reset(self, task_id: Optional[str] = None) -> Observation:
-        """Initialise a new episode.
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        episode_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> AaxObservation:
+        """Initialise a new episode and return the initial observation."""
+        tid = task_id or "task_easy"
+        if tid not in _TASKS:
+            tid = "task_easy"
 
-        Args:
-            task_id: One of the task IDs from tasks.json.  If None, defaults
-                     to "task_easy".
+        task = _TASKS[tid]
+        sid = str(episode_id or uuid.uuid4())
+        self._session_id = sid
 
-        Returns:
-            Initial observation.
-        """
-        if task_id is None:
-            task_id = "task_easy"
+        global _CURRENT_SESSION_ID
+        state_mgr = StateManager(task, max_steps=task.get("max_steps", 8))
+        _SESSIONS[sid] = state_mgr
+        _SESSION_TASKS[sid] = task
+        _CURRENT_SESSION_ID = sid
 
-        if task_id not in self._tasks:
-            available = list(self._tasks.keys())
-            raise ValueError(f"Unknown task_id '{task_id}'. Available: {available}")
+        return self._build_obs(state_mgr, task, reward=None, done=False)
 
-        self._current_task = self._tasks[task_id]
-        max_steps = self._current_task.get("max_steps", 8)
-        self._state_mgr = StateManager(self._current_task, max_steps=max_steps)
-        return self._state_mgr.observation()
+    def step(
+        self,
+        action: AaxAction,
+        timeout_s: Optional[float] = None,
+        **kwargs: Any,
+    ) -> AaxObservation:
+        """Apply action, update state, return new observation."""
+        # Resolve session: prefer instance-local, fall back to global current
+        sid = self._session_id or _CURRENT_SESSION_ID
+        if sid is None or sid not in _SESSIONS:
+            return self.reset()
 
-    def step(self, action: Action) -> Tuple[Observation, Reward, bool, dict]:
-        """Apply an action and advance the environment one step.
+        sm = _SESSIONS[sid]
+        task = _SESSION_TASKS[sid]
 
-        Args:
-            action: An Action instance.
-
-        Returns:
-            (observation, reward, done, info)
-        """
-        self._assert_active()
-
-        sm = self._state_mgr  # type: ignore[union-attr]
-
-        # If already done, return terminal state without changing anything
         if sm.is_done():
-            obs = sm.observation()
-            reward = Reward(value=0.0, reason="Episode already finished.")
-            return obs, reward, True, {"warning": "Episode already done."}
+            obs = self._build_obs(sm, task, reward=0.0, done=True)
+            obs.metadata["warning"] = "Episode already finished."
+            return obs
 
-        # Dispatch to state manager
+        # Dispatch action
         if action.type == "explore":
             target = action.target or ""
             valid = sm.explore_target_valid(target)
             seen = sm.explore_already_seen(target)
             sm.apply_explore(target)
-            reward = self._reward_engine.compute(
-                action,
-                explore_target_valid=valid,
-                explore_already_seen=seen,
+            reward_obj = _reward_engine.compute(
+                action, explore_target_valid=valid, explore_already_seen=seen
             )
 
         elif action.type == "ask":
             sm.apply_ask(action.content)
-            reward = self._reward_engine.compute(action)
+            reward_obj = _reward_engine.compute(action)
 
         elif action.type == "act":
             correct = sm.apply_act(action.content)
-            reward = self._reward_engine.compute(action, act_correct=correct)
+            reward_obj = _reward_engine.compute(action, act_correct=correct)
 
         else:
-            reward = Reward(value=0.0, reason="Unknown action type — no-op.")
+            reward_obj = _reward_engine.compute(action)
 
-        # Check terminal conditions
         done = sm.is_done()
 
-        # If steps exhausted without solving, apply timeout penalty
-        if done and not sm.solved and sm.steps_left == 0:
-            timeout_reward = self._reward_engine.compute(
-                action, timed_out=True
-            )
-            reward = Reward(
-                value=reward.value + timeout_reward.value,
-                reason=f"{reward.reason} {timeout_reward.reason}",
-            )
+        obs = self._build_obs(sm, task, reward=reward_obj.value, done=done)
+        obs.metadata["reward_reason"] = reward_obj.reason
+        obs.metadata["solved"] = sm.solved
+        obs.metadata["ask_count"] = sm.ask_count
+        return obs
 
-        obs = sm.observation()
-        info: dict = {
-            "solved": sm.solved,
-            "steps_taken": sm.steps_taken,
-            "ask_count": sm.ask_count,
-        }
-        return obs, reward, done, info
-
-    def state(self) -> Observation:
-        """Return the current observation without advancing the environment."""
-        self._assert_active()
-        return self._state_mgr.observation()  # type: ignore[union-attr]
+    @property
+    def state(self) -> AaxObservation:
+        """Return the current observation without advancing the episode."""
+        if self._session_id and self._session_id in _SESSIONS:
+            sm = _SESSIONS[self._session_id]
+            task = _SESSION_TASKS[self._session_id]
+            return self._build_obs(sm, task, reward=None, done=sm.is_done())
+        return AaxObservation(task_id="none", task="No active session.")
 
     def grade(self) -> GradeResult:
-        """Compute the final score for the completed episode.
+        """Compute the final score for the current episode."""
+        if self._session_id and self._session_id in _SESSIONS:
+            sm = _SESSIONS[self._session_id]
+            task = _SESSION_TASKS[self._session_id]
+            return _grader.grade(task, solved=sm.solved, steps_taken=sm.steps_taken, ask_count=sm.ask_count)
+        return GradeResult(score=0.0, solved=False, efficient=False, minimal_ask=True, breakdown={}, summary="No active session.")
 
-        Can be called at any point, but most meaningful after done=True.
-        """
-        self._assert_active()
-        sm = self._state_mgr  # type: ignore[union-attr]
-        return self._grader.grade(
-            self._current_task,  # type: ignore[arg-type]
-            solved=sm.solved,
-            steps_taken=sm.steps_taken,
-            ask_count=sm.ask_count,
-        )
+    def close(self) -> None:
+        """No-op: session state lives in module-level store, not the instance."""
+        pass
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
     # ------------------------------------------------------------------ #
 
-    def available_tasks(self) -> List[str]:
-        """Return list of task IDs sorted by difficulty."""
-        order = {"easy": 0, "medium": 1, "hard": 2}
-        return sorted(
-            self._tasks.keys(),
-            key=lambda tid: order.get(self._tasks[tid]["difficulty"], 99),
+    @staticmethod
+    def _build_obs(
+        sm: StateManager,
+        task: Dict[str, Any],
+        reward: Optional[float],
+        done: bool,
+    ) -> AaxObservation:
+        return AaxObservation(
+            task_id=task["id"],
+            task=task["scenario"],
+            difficulty=task["difficulty"],
+            scenario=task["scenario"],
+            screen=sm._screen,
+            logs=sm._logs,
+            revealed_info=list(sm._revealed),
+            history=list(sm._history),
+            steps_taken=sm._steps_taken,
+            steps_left=sm.steps_left,
+            ask_count=sm._ask_count,
+            reward=reward,
+            done=done,
         )
-
-    def task_info(self, task_id: str) -> Dict[str, Any]:
-        """Return public metadata for a task (no ground truth exposed)."""
-        task = self._tasks[task_id]
-        return {
-            "id": task["id"],
-            "difficulty": task["difficulty"],
-            "title": task["title"],
-            "scenario": task["scenario"],
-            "max_steps": task["max_steps"],
-        }
-
-    # ------------------------------------------------------------------ #
-    # Internal                                                             #
-    # ------------------------------------------------------------------ #
-
-    def _assert_active(self) -> None:
-        if self._state_mgr is None or self._current_task is None:
-            raise RuntimeError("Environment not initialised. Call reset() first.")

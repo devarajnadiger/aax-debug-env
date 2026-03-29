@@ -16,7 +16,16 @@ Properties:
 
 from __future__ import annotations
 
-from .models import Action, Reward
+from pydantic import BaseModel
+
+
+class Reward(BaseModel):
+    value: float
+    reason: str
+
+
+# Accept any action-like object (duck typing)
+Action = object
 
 
 class RewardEngine:
