@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "aax-debug-env"
@@ -11,12 +11,14 @@ license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0,<3.0",
-    "anthropic>=0.25.0",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.29.0",
 ]
 
 [project.optional-dependencies]
+inference = [
+    "anthropic>=0.25.0",
+]
 dev = [
     "httpx",
     "pytest",
