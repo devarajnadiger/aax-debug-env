@@ -11,6 +11,7 @@ class Observation(BaseModel):
     """What the agent sees at each step."""
 
     task_id: str
+    task: str = ""           # human-readable task description (alias for scenario)
     difficulty: Literal["easy", "medium", "hard"]
     scenario: str
     screen: str

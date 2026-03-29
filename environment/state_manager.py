@@ -71,6 +71,7 @@ class StateManager:
     def observation(self) -> Observation:
         return Observation(
             task_id=self._task["id"],
+            task=self._task["scenario"],
             difficulty=self._task["difficulty"],
             scenario=self._task["scenario"],
             screen=self._screen,

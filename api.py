@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from environment import AaxDebugEnv
-from environment.models import Action, GradeResult, Observation
+from environment.models import Action, GradeResult, Observation, Reward
 
 app = FastAPI(
     title="Ask–Act–Explore Debug Environment",
@@ -66,8 +66,7 @@ class StepRequest(BaseModel):
 
 class StepResponse(BaseModel):
     observation: Observation
-    reward: float
-    reward_reason: str
+    reward: Reward           # {"value": float, "reason": str}
     done: bool
     info: dict
 
@@ -166,8 +165,7 @@ def step(
     obs, reward, done, info = env.step(body.action)
     return StepResponse(
         observation=obs,
-        reward=reward.value,
-        reward_reason=reward.reason,
+        reward=reward,
         done=done,
         info=info,
     )

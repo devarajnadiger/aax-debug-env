@@ -183,7 +183,7 @@ def run_episode(
         total_reward += reward.value
         last_reward_reason = reward.reason
 
-        print(f"         Reward: {reward.value:+.1f}  ({reward.reason})")
+        print(f"         Reward: {reward.value:+.1f}  ({reward.reason})")  # type: ignore[union-attr]
 
         if done:
             break
