@@ -1,0 +1,110 @@
+[
+  {
+    "id": "task_easy",
+    "difficulty": "easy",
+    "title": "NullPointerException on App Launch",
+    "scenario": "A mobile app crashes immediately on startup. The crash report is in the log.",
+    "initial_screen": "App crashes on launch. Splash screen never appears.",
+    "initial_logs": "E/AndroidRuntime: FATAL EXCEPTION: main\n  java.lang.NullPointerException: Attempt to invoke virtual method on a null object reference\n  at com.example.app.MainActivity.onCreate(MainActivity.java:42)\n  at android.app.Activity.performCreate(Activity.java:8051)",
+    "explore_steps": [
+      {
+        "target": "stack_trace",
+        "reveals": "Full stack trace: NullPointerException at MainActivity.java:42 — userPrefs object is null because SharedPreferences was not initialized before use."
+      },
+      {
+        "target": "source_code",
+        "reveals": "MainActivity.java:40-44:\n  SharedPreferences userPrefs;\n  String theme = userPrefs.getString(\"theme\", \"light\");  // line 42 — userPrefs never initialized"
+      }
+    ],
+    "oracle_hints": {
+      "1": "The crash is in MainActivity. Look at what object is null on line 42.",
+      "2": "SharedPreferences must be obtained via getSharedPreferences() before use."
+    },
+    "ground_truth": {
+      "root_cause": "SharedPreferences not initialized before access",
+      "fix": "Initialize userPrefs with getSharedPreferences(\"app_prefs\", MODE_PRIVATE) before line 42",
+      "file": "MainActivity.java",
+      "line": 42
+    },
+    "correct_actions": ["explore:stack_trace", "act:fix_null_pointer"],
+    "max_steps": 6,
+    "min_steps_for_bonus": 3
+  },
+  {
+    "id": "task_medium",
+    "difficulty": "medium",
+    "title": "Intermittent Login Failure",
+    "scenario": "Users report login fails roughly 30% of the time. No crash — just silent auth failure. Logs are noisy with multiple subsystems.",
+    "initial_screen": "Login screen. User taps 'Sign In'. Sometimes succeeds, sometimes shows 'Invalid credentials' despite correct password.",
+    "initial_logs": "D/NetworkManager: Request queued [id=881]\nD/Cache: Hit for user_session_token\nI/AuthService: Attempting login for user@example.com\nD/NetworkManager: Request queued [id=882]\nW/TokenRefresh: Token refresh skipped — within validity window\nD/Analytics: Event tracked: login_attempt\nI/AuthService: Response received [status=401]",
+    "explore_steps": [
+      {
+        "target": "network_logs",
+        "reveals": "Full network log: Request 881 is a token refresh (POST /auth/refresh). Request 882 is the login call (POST /auth/login). Request 882 is dispatched BEFORE Request 881 completes — race condition."
+      },
+      {
+        "target": "auth_flow",
+        "reveals": "AuthService sends login request immediately after triggering token refresh, without awaiting the refresh result. On slow networks, the stale token is used for the login request, causing 401."
+      },
+      {
+        "target": "source_code",
+        "reveals": "AuthService.kt:88-95:\n  tokenRefreshManager.refresh()  // async, not awaited\n  val response = apiClient.login(credentials)  // uses potentially stale token\n  // BUG: should be: tokenRefreshManager.refresh().await() before login"
+      }
+    ],
+    "oracle_hints": {
+      "1": "The failure is intermittent — think about timing or ordering issues between async operations.",
+      "2": "Look at the sequence of network requests. Are they happening in the right order?",
+      "3": "The token refresh and login call are both async. Check whether one waits for the other."
+    },
+    "ground_truth": {
+      "root_cause": "Race condition — login dispatched before token refresh completes",
+      "fix": "Await token refresh before dispatching login request in AuthService.kt:88",
+      "file": "AuthService.kt",
+      "line": 88
+    },
+    "correct_actions": ["explore:network_logs", "explore:auth_flow", "act:fix_race_condition"],
+    "max_steps": 8,
+    "min_steps_for_bonus": 5
+  },
+  {
+    "id": "task_hard",
+    "difficulty": "hard",
+    "title": "Silent Data Corruption in Offline Mode",
+    "scenario": "Users report that after working offline and syncing, some records are silently overwritten with stale data. Logs appear clean. The issue only affects multi-device users.",
+    "initial_screen": "Data sync screen. 'Sync complete' shown. But user reports records edited on Device A were overwritten by older data from Device B.",
+    "initial_logs": "I/SyncEngine: Sync started\nI/SyncEngine: Fetched 47 remote records\nI/ConflictResolver: No conflicts detected\nI/SyncEngine: Wrote 47 records to local DB\nI/SyncEngine: Sync complete [duration=1.2s]",
+    "explore_steps": [
+      {
+        "target": "sync_logs",
+        "reveals": "Extended sync log: ConflictResolver uses `last_modified` timestamps to resolve conflicts. Timestamps are device-local (not server-normalized). Device B had its clock set forward 2 hours last week, making its records appear newer."
+      },
+      {
+        "target": "conflict_resolver",
+        "reveals": "ConflictResolver.java:201:\n  if (remote.lastModified > local.lastModified) {\n      applyRemote(remote);  // remote wins — but timestamps are not normalized to UTC server time\n  }"
+      },
+      {
+        "target": "database_schema",
+        "reveals": "Schema: records table has `last_modified BIGINT` storing device epoch milliseconds. No server_timestamp column exists. Records from Device B have last_modified values ~7200000ms (2 hours) ahead of Device A records edited at the same real time."
+      },
+      {
+        "target": "network_logs",
+        "reveals": "Network log shows server returns records with device-provided timestamps unchanged — server does not inject its own timestamp on write. Server-side timestamp injection is disabled in config: TRUST_CLIENT_TIMESTAMPS=true"
+      }
+    ],
+    "oracle_hints": {
+      "1": "The logs say 'no conflicts detected' — but that conclusion depends on how conflicts are identified. What data is used to detect them?",
+      "2": "Timestamps are central to the conflict resolution strategy. Where do those timestamps originate?",
+      "3": "The issue only affects multi-device users. Think about what differs between two devices that wouldn't differ on a single device.",
+      "4": "Device clocks can drift or be manually adjusted. If your system trusts device clocks for ordering, what could go wrong?"
+    },
+    "ground_truth": {
+      "root_cause": "Conflict resolver uses unsynchronized device-local timestamps; Device B clock was ahead, causing its stale records to win",
+      "fix": "Use server-assigned timestamps (disable TRUST_CLIENT_TIMESTAMPS, add server_timestamp column) or implement vector clocks for conflict resolution",
+      "file": "ConflictResolver.java",
+      "line": 201
+    },
+    "correct_actions": ["explore:sync_logs", "explore:conflict_resolver", "ask", "act:fix_timestamp_conflict"],
+    "max_steps": 8,
+    "min_steps_for_bonus": 6
+  }
+]
