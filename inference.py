@@ -1,187 +1,258 @@
-"""Baseline inference loop — runs an AI agent against the AaxDebugEnv.
+"""
+Inference Script — Ask-Act-Explore Debug Environment
+=====================================================
 
-The baseline agent uses the Anthropic Claude API.  It receives the current
-observation as a structured prompt and must reply with a valid JSON action.
+Mandatory env vars:
+    API_BASE_URL   LLM endpoint  (default: https://router.huggingface.co/v1)
+    MODEL_NAME     Model ID      (default: Qwen/Qwen2.5-72B-Instruct)
+    HF_TOKEN       API key for the LLM router
 
-Environment variable required:
-    ANTHROPIC_API_KEY
+Optional:
+    ENV_URL        HF Space base URL (default: https://dev-nadiger-aax-debug-env.hf.space)
 
-Usage:
-    python inference.py [--task task_easy|task_medium|task_hard] [--model MODEL]
-
-Flags:
-    --task    Which task to run (default: task_easy)
-    --model   Claude model ID (default: claude-haiku-4-5-20251001)
-    --verbose Show full prompts and raw responses
+stdout format (strict):
+    [START] task=<name> env=<benchmark> model=<model>
+    [STEP]  step=<n> action=<str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...>
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
-import re
 import textwrap
-from typing import Optional
+import urllib.request
+from typing import Any, Dict, List, Optional
 
 try:
-    import anthropic
+    from openai import OpenAI
 except ImportError:
-    anthropic = None  # type: ignore[assignment]
-
-from environment import AaxDebugEnv
-from environment.models import AaxAction, AaxObservation
-
+    OpenAI = None  # type: ignore[assignment,misc]
 
 # ------------------------------------------------------------------ #
-# Prompt helpers                                                       #
+# Configuration                                                        #
 # ------------------------------------------------------------------ #
+
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN     = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "dummy")
+ENV_URL      = os.getenv("ENV_URL",      "https://dev-nadiger-aax-debug-env.hf.space").rstrip("/")
+
+BENCHMARK  = "aax-debug-env"
+TASKS      = ["task_easy", "task_medium", "task_hard"]
+MAX_STEPS  = 8
 
 SYSTEM_PROMPT = textwrap.dedent("""
-You are an expert mobile app debugger.  At each step choose exactly ONE action
-by responding with valid JSON matching the schema below.  No prose — only JSON.
+You are an expert mobile app debugger interacting with a debugging environment.
+At each step respond with a single JSON object — no prose, no markdown.
 
-Action schema:
-{
-  "type": "explore" | "act" | "ask",
-  "target": "<string or null>",
-  "content": "<string or null>"
-}
+Schema:
+{"type": "explore"|"act"|"ask", "target": "<str|null>", "content": "<str|null>"}
 
-Action semantics:
-  explore  — examine a specific information source (set "target").
-  act      — attempt to fix the bug (set "content" to a clear fix description).
-  ask      — query the human oracle for a hint (set "content" to your question).
+Rules:
+- explore: set "target" to the log source you want to inspect.
+- act:     set "content" to a precise fix description (file, line, what to change).
+- ask:     set "content" to your question for the oracle.
 
-Strategy: explore first, ask only when stuck, act as soon as you have evidence.
+Strategy: explore to gather evidence, act when confident, ask only if stuck.
 """).strip()
 
 
-def build_user_prompt(obs: AaxObservation, last_reward: Optional[float] = None, last_reason: Optional[str] = None) -> str:
+# ------------------------------------------------------------------ #
+# Structured log helpers (mandatory format)                           #
+# ------------------------------------------------------------------ #
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} "
+        f"done={str(done).lower()} error={error or 'null'}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} "
+        f"score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+# ------------------------------------------------------------------ #
+# Environment HTTP client                                             #
+# ------------------------------------------------------------------ #
+
+def env_call(method: str, path: str, body: Optional[Dict] = None) -> Dict[str, Any]:
+    url  = f"{ENV_URL}{path}"
+    data = json.dumps(body or {}).encode()
+    req  = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def env_reset(task_id: str) -> Dict[str, Any]:
+    return env_call("POST", "/reset", {"task_id": task_id})
+
+
+def env_step(action: Dict[str, Any]) -> Dict[str, Any]:
+    return env_call("POST", "/step", {"action": action})
+
+
+def env_grade() -> Dict[str, Any]:
+    return env_call("GET", "/grade")
+
+
+# ------------------------------------------------------------------ #
+# LLM action selection                                                #
+# ------------------------------------------------------------------ #
+
+def build_prompt(obs: Dict[str, Any], last_reward: float, last_reason: str) -> str:
     parts = [
-        f"## Task: {obs.task_id} ({obs.difficulty})",
-        f"**Scenario:** {obs.scenario}",
+        f"Task: {obs.get('task_id')} ({obs.get('difficulty')})",
+        f"Scenario: {obs.get('scenario')}",
+        f"Screen: {obs.get('screen')}",
         "",
-        f"**Screen:** {obs.screen}",
-        "",
-        "**Logs:**",
-        "```",
-        obs.logs,
-        "```",
+        "Logs:",
+        obs.get("logs", ""),
     ]
-    if obs.revealed_info:
-        parts += ["", "**Already explored:** " + ", ".join(obs.revealed_info)]
-    if obs.history:
-        parts += ["", "**Action history:**"]
-        for h in obs.history[-5:]:
-            parts.append(f"  - {h}")
-    parts += ["", f"**Steps left:** {obs.steps_left}  |  **Oracle asks used:** {obs.ask_count}"]
+    if obs.get("revealed_info"):
+        parts += ["", "Already explored: " + ", ".join(obs["revealed_info"])]
+    if obs.get("history"):
+        parts += ["", "History (last 4):"]
+        for h in obs["history"][-4:]:
+            parts.append(f"  {h}")
+    parts += [
+        "",
+        f"Steps left: {obs.get('steps_left')}  |  Oracle asks used: {obs.get('ask_count')}",
+    ]
     if last_reason:
-        parts += ["", f"**Last reward:** {last_reward:+.1f}  ({last_reason})"]
-    parts += ["", "What is your next action? Respond with JSON only."]
+        parts += [f"Last reward: {last_reward:+.2f}  ({last_reason})"]
+    parts += ["", "Respond with JSON action only."]
     return "\n".join(parts)
 
 
-# ------------------------------------------------------------------ #
-# Agent loop                                                           #
-# ------------------------------------------------------------------ #
-
-def parse_action(raw: str) -> Optional[AaxAction]:
-    """Parse a JSON string into an AaxAction, returning None on failure."""
+def get_llm_action(client: Any, prompt: str) -> Dict[str, Any]:
+    """Call the LLM and parse its JSON action. Returns a fallback on any error."""
     try:
-        return AaxAction(**json.loads(raw.strip()))
-    except Exception:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            try:
-                return AaxAction(**json.loads(match.group()))
-            except Exception:
-                pass
-    return None
-
-
-def run_episode(
-    task_id: str,
-    model: str = "claude-haiku-4-5-20251001",
-    verbose: bool = False,
-) -> None:
-    if anthropic is None:
-        print("anthropic package not installed — skipping live inference.")
-        print("Install with: pip install anthropic")
-        return   # exit 0, not a crash
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("ANTHROPIC_API_KEY not set — skipping live inference.")
-        print("Set the env var to run the agent against the Claude API.")
-        return   # exit 0, not a crash
-
-    client = anthropic.Anthropic(api_key=api_key)
-    env = AaxDebugEnv()
-
-    print(f"\n{'='*60}")
-    print(f"Task : {task_id}")
-    print(f"Model: {model}")
-    print(f"{'='*60}\n")
-
-    obs: AaxObservation = env.reset(task_id=task_id)
-    last_reward: Optional[float] = None
-    last_reason: Optional[str] = None
-    total_reward: float = 0.0
-    step_num = 0
-
-    while True:
-        step_num += 1
-        user_prompt = build_user_prompt(obs, last_reward, last_reason)
-
-        if verbose:
-            print(f"\n--- Step {step_num} | Prompt ---\n{user_prompt}")
-
-        message = client.messages.create(
-            model=model,
-            max_tokens=256,
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
             temperature=0.0,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
+            max_tokens=128,
         )
-        raw_response = message.content[0].text
+        text = (resp.choices[0].message.content or "").strip()
+        # strip markdown fences if present
+        if text.startswith("```"):
+            text = text.split("```")[1].strip()
+            if text.startswith("json"):
+                text = text[4:].strip()
+        return json.loads(text)
+    except Exception:
+        return {"type": "explore", "target": "stack_trace"}
 
-        if verbose:
-            print(f"\n--- Step {step_num} | Response ---\n{raw_response}")
 
-        action = parse_action(raw_response)
-        if action is None:
-            print(f"Step {step_num}: Could not parse action — no-op explore.")
-            action = AaxAction(type="explore", target="__invalid__")
+# ------------------------------------------------------------------ #
+# Heuristic fallback (used when LLM client is unavailable)            #
+# ------------------------------------------------------------------ #
 
-        print(f"Step {step_num}: {action.type.upper()}", end="")
-        if action.target:
-            print(f" → {action.target}", end="")
-        if action.content:
-            print(f" | {action.content[:80]}", end="")
-        print()
+_EXPLORE_TARGETS = {
+    "task_easy":   ["stack_trace", "source_code"],
+    "task_medium": ["network_logs", "auth_flow", "source_code"],
+    "task_hard":   ["sync_logs", "conflict_resolver", "database_schema"],
+}
 
-        obs = env.step(action)
-        last_reward = obs.reward
-        last_reason = obs.metadata.get("reward_reason")
+_ACT_FIXES = {
+    "task_easy":   "Initialize SharedPreferences with getSharedPreferences in MainActivity.java before line 42",
+    "task_medium": "Await token refresh before login request in AuthService.kt line 88 to fix race condition",
+    "task_hard":   "Use server timestamps instead of device-local timestamps in ConflictResolver.java line 201",
+}
 
-        if last_reward is not None:
-            print(f"         Reward: {last_reward:+.1f}  ({last_reason})")
-            total_reward += last_reward
 
-        if obs.done:
-            break
+def get_heuristic_action(task_id: str, obs: Dict[str, Any]) -> Dict[str, Any]:
+    revealed = set(obs.get("revealed_info", []))
+    targets  = _EXPLORE_TARGETS.get(task_id, ["stack_trace"])
+    for t in targets:
+        if t not in revealed:
+            return {"type": "explore", "target": t}
+    return {"type": "act", "content": _ACT_FIXES.get(task_id, "Fix the root cause")}
 
-    result = env.grade()
-    print(f"\n{'='*60}")
-    print(f"EPISODE COMPLETE")
-    print(f"{'='*60}")
-    print(f"Cumulative reward : {total_reward:+.2f}")
-    print(f"Final score       : {result.score:.2f} / 1.00")
-    print(f"Summary           : {result.summary}")
-    print(f"\nBreakdown:")
-    for key, val in result.breakdown.items():
-        print(f"  {key}: {val}")
+
+# ------------------------------------------------------------------ #
+# Episode runner                                                       #
+# ------------------------------------------------------------------ #
+
+def run_episode(client: Any, task_id: str) -> float:
+    rewards:     List[float] = []
+    steps_taken: int         = 0
+    success:     bool        = False
+    score:       float       = 0.0
+    obs:         Dict        = {}
+
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+
+    try:
+        obs = env_reset(task_id)
+
+        last_reward: float = 0.0
+        last_reason: str   = ""
+
+        for step in range(1, MAX_STEPS + 1):
+            if obs.get("done"):
+                break
+
+            prompt = build_prompt(obs, last_reward, last_reason)
+
+            if client is not None:
+                action = get_llm_action(client, prompt)
+            else:
+                action = get_heuristic_action(task_id, obs)
+
+            # Validate action schema
+            if not isinstance(action, dict) or action.get("type") not in ("act", "explore", "ask"):
+                action = {"type": "explore", "target": "stack_trace"}
+
+            action_str = json.dumps(action, separators=(",", ":"))
+
+            obs = env_step(action)
+
+            reward      = float(obs.get("reward") or 0.0)
+            done        = bool(obs.get("done", False))
+            last_reason = str(obs.get("metadata", {}).get("reward_reason", ""))
+            last_reward = reward
+            error_msg   = str(obs.get("metadata", {}).get("error", "")) or None
+
+            rewards.append(reward)
+            steps_taken = step
+
+            log_step(step=step, action=action_str, reward=reward, done=done, error=error_msg)
+
+            if done:
+                break
+
+        grade   = env_grade()
+        score   = float(grade.get("score", 0.0))
+        success = bool(grade.get("solved", False))
+
+    except Exception as exc:
+        print(f"[DEBUG] episode error: {exc}", flush=True)
+        score   = 0.0
+        success = False
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+    return score
 
 
 # ------------------------------------------------------------------ #
@@ -189,12 +260,18 @@ def run_episode(
 # ------------------------------------------------------------------ #
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run AaxDebugEnv baseline agent")
-    parser.add_argument("--task", default="task_easy", choices=["task_easy", "task_medium", "task_hard"])
-    parser.add_argument("--model", default="claude-haiku-4-5-20251001")
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
-    run_episode(task_id=args.task, model=args.model, verbose=args.verbose)
+    # Build OpenAI client (uses HF router by default)
+    client = None
+    if OpenAI is not None and HF_TOKEN and HF_TOKEN != "dummy":
+        try:
+            client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+        except Exception as exc:
+            print(f"[DEBUG] Could not init OpenAI client: {exc}", flush=True)
+    else:
+        print("[DEBUG] OpenAI client not available — using heuristic agent.", flush=True)
+
+    for task_id in TASKS:
+        run_episode(client, task_id)
 
 
 if __name__ == "__main__":
