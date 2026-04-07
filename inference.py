@@ -21,7 +21,6 @@ import argparse
 import json
 import os
 import re
-import sys
 import textwrap
 from typing import Optional
 
@@ -107,13 +106,15 @@ def run_episode(
     verbose: bool = False,
 ) -> None:
     if anthropic is None:
-        print("ERROR: 'anthropic' package not installed. Run: pip install anthropic", file=sys.stderr)
-        sys.exit(1)
+        print("anthropic package not installed — skipping live inference.")
+        print("Install with: pip install anthropic")
+        return   # exit 0, not a crash
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY environment variable not set.", file=sys.stderr)
-        sys.exit(1)
+        print("ANTHROPIC_API_KEY not set — skipping live inference.")
+        print("Set the env var to run the agent against the Claude API.")
+        return   # exit 0, not a crash
 
     client = anthropic.Anthropic(api_key=api_key)
     env = AaxDebugEnv()
