@@ -33,10 +33,10 @@ except ImportError:
 # Configuration                                                        #
 # ------------------------------------------------------------------ #
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN     = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "dummy")
-ENV_URL      = os.getenv("ENV_URL",      "https://dev-nadiger-aax-debug-env.hf.space").rstrip("/")
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+API_KEY      = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN", "")
+ENV_URL      = os.environ.get("ENV_URL", "https://dev-nadiger-aax-debug-env.hf.space").rstrip("/")
 
 BENCHMARK  = "aax-debug-env"
 TASKS      = ["task_easy", "task_medium", "task_hard"]
@@ -88,12 +88,10 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 # ------------------------------------------------------------------ #
 
 def env_call(method: str, path: str, body: Optional[Dict] = None) -> Dict[str, Any]:
-    url  = f"{ENV_URL}{path}"
-    data = json.dumps(body or {}).encode()
-    req  = urllib.request.Request(
-        url, data=data, method=method,
-        headers={"Content-Type": "application/json"},
-    )
+    url     = f"{ENV_URL}{path}"
+    data    = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    req     = urllib.request.Request(url, data=data, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 
@@ -139,8 +137,8 @@ def build_prompt(obs: Dict[str, Any], last_reward: float, last_reason: str) -> s
     return "\n".join(parts)
 
 
-def get_llm_action(client: Any, prompt: str) -> Dict[str, Any]:
-    """Call the LLM and parse its JSON action. Returns a fallback on any error."""
+def get_llm_action(client: Any, prompt: str, task_id: str, obs: Dict[str, Any]) -> Dict[str, Any]:
+    """Call the LLM and parse its JSON action. Falls back to heuristic on any error."""
     try:
         resp = client.chat.completions.create(
             model=MODEL_NAME,
@@ -157,9 +155,13 @@ def get_llm_action(client: Any, prompt: str) -> Dict[str, Any]:
             text = text.split("```")[1].strip()
             if text.startswith("json"):
                 text = text[4:].strip()
-        return json.loads(text)
-    except Exception:
-        return {"type": "explore", "target": "stack_trace"}
+        action = json.loads(text)
+        if isinstance(action, dict) and action.get("type") in ("act", "explore", "ask"):
+            return action
+        raise ValueError(f"Invalid action: {action}")
+    except Exception as exc:
+        print(f"[DEBUG] LLM parse error: {exc}", flush=True)
+        return get_heuristic_action(task_id, obs)
 
 
 # ------------------------------------------------------------------ #
@@ -214,13 +216,9 @@ def run_episode(client: Any, task_id: str) -> float:
             prompt = build_prompt(obs, last_reward, last_reason)
 
             if client is not None:
-                action = get_llm_action(client, prompt)
+                action = get_llm_action(client, prompt, task_id, obs)
             else:
                 action = get_heuristic_action(task_id, obs)
-
-            # Validate action schema
-            if not isinstance(action, dict) or action.get("type") not in ("act", "explore", "ask"):
-                action = {"type": "explore", "target": "stack_trace"}
 
             action_str = json.dumps(action, separators=(",", ":"))
 
@@ -260,15 +258,16 @@ def run_episode(client: Any, task_id: str) -> float:
 # ------------------------------------------------------------------ #
 
 def main() -> None:
-    # Build OpenAI client (uses HF router by default)
+    # Always initialize with injected API_KEY and API_BASE_URL (validator requirement)
     client = None
-    if OpenAI is not None and HF_TOKEN and HF_TOKEN != "dummy":
+    if OpenAI is not None:
         try:
-            client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+            client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY or "placeholder")
+            print(f"[DEBUG] LLM client ready: base_url={API_BASE_URL} model={MODEL_NAME}", flush=True)
         except Exception as exc:
             print(f"[DEBUG] Could not init OpenAI client: {exc}", flush=True)
     else:
-        print("[DEBUG] OpenAI client not available — using heuristic agent.", flush=True)
+        print("[DEBUG] openai package not installed — using heuristic agent.", flush=True)
 
     for task_id in TASKS:
         run_episode(client, task_id)
