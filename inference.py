@@ -20,14 +20,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import textwrap
 from typing import Optional
 
-import anthropic
+try:
+    import anthropic
+except ImportError:
+    anthropic = None  # type: ignore[assignment]
 
 from environment import AaxDebugEnv
-from environment.models import Action, Observation
+from environment.models import AaxAction, AaxObservation
 
 
 # ------------------------------------------------------------------ #
@@ -35,9 +39,8 @@ from environment.models import Action, Observation
 # ------------------------------------------------------------------ #
 
 SYSTEM_PROMPT = textwrap.dedent("""
-You are an expert mobile app debugger.  You are interacting with a debugging
-environment.  At each step you must choose exactly ONE action by responding
-with valid JSON matching the schema below.  No prose, no markdown — only JSON.
+You are an expert mobile app debugger.  At each step choose exactly ONE action
+by responding with valid JSON matching the schema below.  No prose — only JSON.
 
 Action schema:
 {
@@ -47,25 +50,15 @@ Action schema:
 }
 
 Action semantics:
-  explore  — examine a specific information source.
-             Set "target" to one of the available explore targets listed in the
-             observation.  Costs a step but may reveal new clues.
-  act      — attempt to fix the bug.
-             Set "content" to a clear description of the fix (file, line,
-             what to change).  If correct, the task ends with a high reward.
-             If wrong, you lose points but can try again.
-  ask      — query the human oracle for a hint.
-             Set "content" to your question (optional).  The oracle will give
-             a partial hint.  Costs a step AND reduces your efficiency score.
+  explore  — examine a specific information source (set "target").
+  act      — attempt to fix the bug (set "content" to a clear fix description).
+  ask      — query the human oracle for a hint (set "content" to your question).
 
-Strategy:
-  - Explore first to gather evidence before acting.
-  - Only ask when genuinely stuck.
-  - Act as soon as you have enough evidence — don't over-explore.
+Strategy: explore first, ask only when stuck, act as soon as you have evidence.
 """).strip()
 
 
-def build_user_prompt(obs: Observation, last_reward_reason: Optional[str] = None) -> str:
+def build_user_prompt(obs: AaxObservation, last_reward: Optional[float] = None, last_reason: Optional[str] = None) -> str:
     parts = [
         f"## Task: {obs.task_id} ({obs.difficulty})",
         f"**Scenario:** {obs.scenario}",
@@ -77,23 +70,15 @@ def build_user_prompt(obs: Observation, last_reward_reason: Optional[str] = None
         obs.logs,
         "```",
     ]
-
     if obs.revealed_info:
         parts += ["", "**Already explored:** " + ", ".join(obs.revealed_info)]
-
     if obs.history:
         parts += ["", "**Action history:**"]
-        for h in obs.history[-5:]:  # last 5 to keep context tight
+        for h in obs.history[-5:]:
             parts.append(f"  - {h}")
-
-    parts += [
-        "",
-        f"**Steps left:** {obs.steps_left}  |  **Oracle asks used:** {obs.ask_count}",
-    ]
-
-    if last_reward_reason:
-        parts += ["", f"**Last reward:** {last_reward_reason}"]
-
+    parts += ["", f"**Steps left:** {obs.steps_left}  |  **Oracle asks used:** {obs.ask_count}"]
+    if last_reason:
+        parts += ["", f"**Last reward:** {last_reward:+.1f}  ({last_reason})"]
     parts += ["", "What is your next action? Respond with JSON only."]
     return "\n".join(parts)
 
@@ -102,19 +87,15 @@ def build_user_prompt(obs: Observation, last_reward_reason: Optional[str] = None
 # Agent loop                                                           #
 # ------------------------------------------------------------------ #
 
-def parse_action(raw: str) -> Optional[Action]:
-    """Parse a JSON string into an Action, returning None on failure."""
+def parse_action(raw: str) -> Optional[AaxAction]:
+    """Parse a JSON string into an AaxAction, returning None on failure."""
     try:
-        data = json.loads(raw.strip())
-        return Action(**data)
+        return AaxAction(**json.loads(raw.strip()))
     except Exception:
-        # Try to extract JSON from a response that has surrounding text
-        import re
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
             try:
-                data = json.loads(match.group())
-                return Action(**data)
+                return AaxAction(**json.loads(match.group()))
             except Exception:
                 pass
     return None
@@ -125,6 +106,10 @@ def run_episode(
     model: str = "claude-haiku-4-5-20251001",
     verbose: bool = False,
 ) -> None:
+    if anthropic is None:
+        print("ERROR: 'anthropic' package not installed. Run: pip install anthropic", file=sys.stderr)
+        sys.exit(1)
+
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("ERROR: ANTHROPIC_API_KEY environment variable not set.", file=sys.stderr)
@@ -134,42 +119,39 @@ def run_episode(
     env = AaxDebugEnv()
 
     print(f"\n{'='*60}")
-    print(f"Task: {task_id}")
+    print(f"Task : {task_id}")
     print(f"Model: {model}")
     print(f"{'='*60}\n")
 
-    obs = env.reset(task_id)
-    last_reward_reason: Optional[str] = None
+    obs: AaxObservation = env.reset(task_id=task_id)
+    last_reward: Optional[float] = None
+    last_reason: Optional[str] = None
     total_reward: float = 0.0
     step_num = 0
 
     while True:
         step_num += 1
-        user_prompt = build_user_prompt(obs, last_reward_reason)
+        user_prompt = build_user_prompt(obs, last_reward, last_reason)
 
         if verbose:
-            print(f"\n--- Step {step_num} | Prompt ---")
-            print(user_prompt)
+            print(f"\n--- Step {step_num} | Prompt ---\n{user_prompt}")
 
-        # Call the model
         message = client.messages.create(
             model=model,
             max_tokens=256,
-            temperature=0.0,          # deterministic
+            temperature=0.0,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )
         raw_response = message.content[0].text
 
         if verbose:
-            print(f"\n--- Step {step_num} | Raw response ---")
-            print(raw_response)
+            print(f"\n--- Step {step_num} | Response ---\n{raw_response}")
 
-        # Parse action
         action = parse_action(raw_response)
         if action is None:
-            print(f"Step {step_num}: Could not parse action — using no-op explore.")
-            action = Action(type="explore", target="__invalid__")
+            print(f"Step {step_num}: Could not parse action — no-op explore.")
+            action = AaxAction(type="explore", target="__invalid__")
 
         print(f"Step {step_num}: {action.type.upper()}", end="")
         if action.target:
@@ -178,17 +160,17 @@ def run_episode(
             print(f" | {action.content[:80]}", end="")
         print()
 
-        # Advance environment
-        obs, reward, done, info = env.step(action)
-        total_reward += reward.value
-        last_reward_reason = reward.reason
+        obs = env.step(action)
+        last_reward = obs.reward
+        last_reason = obs.metadata.get("reward_reason")
 
-        print(f"         Reward: {reward.value:+.1f}  ({reward.reason})")  # type: ignore[union-attr]
+        if last_reward is not None:
+            print(f"         Reward: {last_reward:+.1f}  ({last_reason})")
+            total_reward += last_reward
 
-        if done:
+        if obs.done:
             break
 
-    # Final grade
     result = env.grade()
     print(f"\n{'='*60}")
     print(f"EPISODE COMPLETE")
@@ -211,7 +193,6 @@ def main() -> None:
     parser.add_argument("--model", default="claude-haiku-4-5-20251001")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-
     run_episode(task_id=args.task, model=args.model, verbose=args.verbose)
 
 
